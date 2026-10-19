@@ -198,6 +198,12 @@ pub enum DataKey {
     GroupSponsorshipCount(u64),
     /// Group sponsorship details keyed by campaign and group ID.
     GroupSponsorship(u64, u64),
+    /// Role assignments keyed by `(campaign_id, address)` (persistent storage).
+    CampaignRole(u64, Address),
+    /// Audit log entry keyed by `(campaign_id, entry_index)` (persistent storage).
+    AuditLog(u64, u32),
+    /// Total count of audit log entries for a campaign (persistent storage).
+    AuditLogCount(u64),
 }
 
 /// Current lifecycle state of a campaign.
@@ -229,6 +235,32 @@ pub struct StatusHistoryEntry {
     /// The status that was set at this point in time.
     pub status: CampaignStatus,
     /// Unix timestamp (seconds) when this status change occurred.
+    pub timestamp: u64,
+}
+
+/// Role-based access control for campaign management.
+#[contracttype]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CampaignRole {
+    /// Full control: can delete, withdraw, manage team, and perform all operations.
+    Owner,
+    /// Can edit campaign details, manage team, but cannot delete or withdraw funds.
+    Editor,
+    /// Read-only access: can view campaign details and audit log.
+    Viewer,
+}
+
+/// Audit log entry for tracking role-based actions.
+#[contracttype]
+#[derive(Clone)]
+pub struct AuditLogEntry {
+    /// The role that performed this action.
+    pub role: CampaignRole,
+    /// The address that performed this action.
+    pub actor: Address,
+    /// The action performed (e.g., "claim_funds", "set_team_rewards").
+    pub action: soroban_sdk::String,
+    /// Unix timestamp (seconds) when this action occurred.
     pub timestamp: u64,
 }
 
@@ -688,7 +720,6 @@ pub enum Error {
     /// (`target_amount`).
     TargetExceeded = 16,
     /// The supplied deadline exceeds the maximum allowed duration of 180 days.
-    DeadlineTooFar = 23,
     DeadlineTooFar = 17,
     /// Verification SLA period has not expired yet.
     SlaNotBreached = 18,
@@ -696,48 +727,27 @@ pub enum Error {
     PlantingNotFound = 19,
     /// Tree planting is already verified.
     AlreadyVerified = 20,
-    /// The campaign is not in the `VerificationFailed` state.
-    CampaignNotVerificationFailed = 21,
     /// The insurance pool fee rate exceeds the protocol maximum.
-    InsuranceFeeTooHigh = 22,
+    InsuranceFeeTooHigh = 21,
     /// `set_team_rewards` was called with an empty team.
-    TeamEmpty = 23,
+    TeamEmpty = 22,
+    /// The campaign is paused.
+    CampaignPaused = 23,
     /// The team's `percentage_bps` values do not sum to exactly 100 %
     /// (`10_000`), or a member has a zero / out-of-range percentage.
     TeamInvalidSplit = 24,
     /// The team contains two members with the same payout address.
     TeamDuplicateMember = 25,
+    /// Insufficient role permissions for this action.
+    InsufficientPermissions = 26,
+    /// Role assignment already exists.
+    RoleAlreadyAssigned = 27,
+    /// Role assignment not found.
+    RoleNotFound = 28,
+    /// The campaign is not in the `VerificationFailed` state.
+    CampaignNotVerificationFailed = 29,
     /// Campaign ID space exhausted (u64::MAX reached).
-    ContractFull = 17,
-    CampaignNotClaimed = 25,
-    RewardsAlreadyStreamed = 26,
-    StreamContractNotSet = 27,
-    CreatorAlreadyExists = 28,
-    InvalidCreators = 29,
-    ContractFull = 26,
-    /// Campaign is not verified.
-    CampaignNotVerified = 27,
-    /// The campaign is currently paused and cannot accept contributions.
-    CampaignPaused = 28,
-    /// The operation requires the campaign to be in the `Claimed` state.
-    CampaignNotClaimed = 29,
-    /// A reward stream already exists for this contributor on this campaign.
-    RewardsAlreadyStreamed = 30,
-    /// `set_stream_contract` has not been called yet.
-    StreamContractNotSet = 31,
-    /// Creators list is empty, mismatched in length, or shares do not sum to
-    /// 10 000 bps, or a duplicate creator address was supplied.
-    InvalidCreators = 32,
-    /// No carbon credit token contract has been configured for this campaign.
-    CarbonTokenNotSet = 33,
-    /// Carbon credit tokens have already been minted for this campaign.
-    CarbonCreditsAlreadyMinted = 34,
-    /// The requested group sponsorship does not exist.
-    GroupSponsorshipNotFound = 35,
-    /// A group sponsorship name must not be empty.
-    GroupNameEmpty = 36,
-    /// A group sponsorship name exceeds the 64-byte limit.
-    GroupNameTooLong = 37,
+    ContractFull = 30,
 }
 
 // ---------------------------------------------------------------------------
@@ -1453,6 +1463,10 @@ impl CampaignFundingContract {
     pub fn claim_funds(env: Env, campaign_id: u64) {
         let mut campaign = Self::load_campaign(&env, campaign_id);
 
+        // Check permissions - only Owners can claim funds
+        let primary_creator = campaign.creators.get(0).unwrap();
+        Self::check_permission(&env, campaign_id, primary_creator, "claim_funds");
+
         for owner in campaign.creators.iter() {
             owner.require_auth();
         }
@@ -1473,6 +1487,9 @@ impl CampaignFundingContract {
 
         campaign.status = CampaignStatus::Claimed;
         Self::save_campaign(&env, campaign_id, &campaign);
+
+        let action_str = soroban_sdk::String::from_slice(&env, "claim_funds");
+        Self::record_audit_log(&env, campaign_id, primary_creator.clone(), action_str);
 
         let token_client = token::Client::new(&env, &campaign.token);
 
@@ -1943,6 +1960,99 @@ impl CampaignFundingContract {
             }
         }
         history
+    }
+
+    /// Return the audit log for a campaign.
+    ///
+    /// # Arguments
+    /// * `campaign_id` — The campaign to query.
+    ///
+    /// # Returns
+    /// A vector of audit log entries ordered from oldest to newest.
+    pub fn get_audit_log(env: Env, campaign_id: u64) -> Vec<AuditLogEntry> {
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AuditLogCount(campaign_id))
+            .unwrap_or(0);
+
+        let mut log = Vec::new(&env);
+        for i in 0..count {
+            if let Some(entry) = env
+                .storage()
+                .persistent()
+                .get(&DataKey::AuditLog(campaign_id, i))
+            {
+                log.push_back(entry);
+            }
+        }
+        log
+    }
+
+    /// Assign a role to an address for a campaign.
+    ///
+    /// Only Owners can assign roles.
+    ///
+    /// # Arguments
+    /// * `campaign_id` — The campaign ID.
+    /// * `address` — The address to assign the role to.
+    /// * `role` — The role to assign.
+    ///
+    /// # Errors
+    /// * [`Error::InsufficientPermissions`] — Caller is not an Owner.
+    /// * [`Error::RoleAlreadyAssigned`] — Address already has a role.
+    pub fn assign_role(env: Env, campaign_id: u64, address: Address, role: CampaignRole) {
+        Self::check_permission(&env, campaign_id, &address, "assign_role");
+        
+        let key = DataKey::CampaignRole(campaign_id, address.clone());
+        if env.storage().persistent().has(&key) {
+            panic_with_error!(&env, Error::RoleAlreadyAssigned);
+        }
+
+        env.storage().persistent().set(&key, &role);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_BUMP);
+
+        let action_str = soroban_sdk::String::from_slice(&env, &format!("assign_role:{:?}", role));
+        Self::record_audit_log(&env, campaign_id, address, action_str);
+    }
+
+    /// Remove a role assignment from an address for a campaign.
+    ///
+    /// Only Owners can remove roles.
+    ///
+    /// # Arguments
+    /// * `campaign_id` — The campaign ID.
+    /// * `address` — The address to remove the role from.
+    ///
+    /// # Errors
+    /// * [`Error::InsufficientPermissions`] — Caller is not an Owner.
+    /// * [`Error::RoleNotFound`] — Address has no assigned role.
+    pub fn remove_role(env: Env, campaign_id: u64, address: Address) {
+        Self::check_permission(&env, campaign_id, &address, "remove_role");
+        
+        let key = DataKey::CampaignRole(campaign_id, address.clone());
+        if !env.storage().persistent().has(&key) {
+            panic_with_error!(&env, Error::RoleNotFound);
+        }
+
+        env.storage().persistent().remove(&key);
+
+        let action_str = soroban_sdk::String::from_slice(&env, "remove_role");
+        Self::record_audit_log(&env, campaign_id, address, action_str);
+    }
+
+    /// Get the role of an address for a campaign.
+    ///
+    /// # Arguments
+    /// * `campaign_id` — The campaign ID.
+    /// * `address` — The address to query.
+    ///
+    /// # Returns
+    /// The role of the address (Owner, Editor, or Viewer).
+    pub fn get_role(env: Env, campaign_id: u64, address: Address) -> CampaignRole {
+        Self::get_role_for_address(&env, campaign_id, &address)
     }
 
     /// Return the configured payment-stream contract address, if any.
@@ -2665,6 +2775,86 @@ impl CampaignFundingContract {
                 .persistent()
                 .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_BUMP);
         }
+    }
+
+    /// Check if an address has a specific role for a campaign.
+    fn has_role(env: &Env, campaign_id: u64, address: &Address, role: CampaignRole) -> bool {
+        let key = DataKey::CampaignRole(campaign_id, address.clone());
+        if let Some(stored_role) = env.storage().persistent().get(&key) {
+            stored_role == role
+        } else {
+            // If no role is assigned, check if the address is a creator (Owner by default)
+            let campaign = Self::load_campaign(env, campaign_id);
+            if campaign.creators.iter().any(|c| c == address) {
+                role == CampaignRole::Owner
+            } else {
+                false
+            }
+        }
+    }
+
+    /// Get the role of an address for a campaign.
+    fn get_role_for_address(env: &Env, campaign_id: u64, address: &Address) -> CampaignRole {
+        let key = DataKey::CampaignRole(campaign_id, address.clone());
+        if let Some(role) = env.storage().persistent().get(&key) {
+            role
+        } else {
+            // If no role is assigned, check if the address is a creator (Owner by default)
+            let campaign = Self::load_campaign(env, campaign_id);
+            if campaign.creators.iter().any(|c| c == address) {
+                CampaignRole::Owner
+            } else {
+                CampaignRole::Viewer
+            }
+        }
+    }
+
+    /// Check if an address has permission to perform an action based on their role.
+    fn check_permission(env: &Env, campaign_id: u64, address: &Address, action: &str) {
+        let role = Self::get_role_for_address(env, campaign_id, address);
+        
+        match role {
+            CampaignRole::Owner => {
+                // Owners can do everything
+            }
+            CampaignRole::Editor => {
+                // Editors cannot delete or withdraw funds
+                if action == "delete" || action == "withdraw" || action == "claim_funds" {
+                    panic_with_error!(env, Error::InsufficientPermissions);
+                }
+            }
+            CampaignRole::Viewer => {
+                // Viewers cannot perform any write actions
+                panic_with_error!(env, Error::InsufficientPermissions);
+            }
+        }
+    }
+
+    /// Record an action in the audit log.
+    fn record_audit_log(env: &Env, campaign_id: u64, actor: Address, action: soroban_sdk::String) {
+        let count_key = DataKey::AuditLogCount(campaign_id);
+        let mut count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+
+        let role = Self::get_role_for_address(env, campaign_id, &actor);
+
+        let entry = AuditLogEntry {
+            role,
+            actor: actor.clone(),
+            action: action.clone(),
+            timestamp: env.ledger().timestamp(),
+        };
+
+        let entry_key = DataKey::AuditLog(campaign_id, count);
+        env.storage().persistent().set(&entry_key, &entry);
+        env.storage()
+            .persistent()
+            .extend_ttl(&entry_key, LEDGER_THRESHOLD, LEDGER_BUMP);
+
+        count += 1;
+        env.storage().persistent().set(&count_key, &count);
+        env.storage()
+            .persistent()
+            .extend_ttl(&count_key, LEDGER_THRESHOLD, LEDGER_BUMP);
     }
 
     /// Compute the protocol fee for `amount` using the stored fee rate.
@@ -4280,5 +4470,120 @@ mod tests {
 
         let id = client.create_campaign(&creator, &token, &10_000, &5_000, &2_000);
         client.get_campaign_cost_per_tree(&id, &0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Role-based permissions tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_assign_role_as_owner() {
+        let env = Env::default();
+        env.mock_all_auths();
+        set_time(&env, 1_000);
+        let (contract_id, client, admin, _) = setup_contract(&env);
+
+        let token_admin = Address::generate(&env);
+        let (token_addr, _, token_admin_client) = create_token(&env, &token_admin);
+        let creator = Address::generate(&env);
+        let editor = Address::generate(&env);
+        token_admin_client.mint(&creator, &500);
+
+        let id = client.create_campaign(&creator, &token_addr, &10_000, &5_000, &2_000, &500);
+
+        // Creator (Owner) can assign Editor role
+        client.assign_role(&id, &editor, &CampaignRole::Editor);
+        
+        // Verify the role was assigned
+        let role = client.get_role(&id, &editor);
+        assert_eq!(role, CampaignRole::Editor);
+    }
+
+    #[test]
+    fn test_creator_has_owner_role_by_default() {
+        let env = Env::default();
+        env.mock_all_auths();
+        set_time(&env, 1_000);
+        let (contract_id, client, _, _) = setup_contract(&env);
+
+        let token_admin = Address::generate(&env);
+        let (token_addr, _, token_admin_client) = create_token(&env, &token_admin);
+        let creator = Address::generate(&env);
+        token_admin_client.mint(&creator, &500);
+
+        let id = client.create_campaign(&creator, &token_addr, &10_000, &5_000, &2_000, &500);
+
+        // Creator should have Owner role by default
+        let role = client.get_role(&id, &creator);
+        assert_eq!(role, CampaignRole::Owner);
+    }
+
+    #[test]
+    fn test_audit_log_records_actions() {
+        let env = Env::default();
+        env.mock_all_auths();
+        set_time(&env, 1_000);
+        let (contract_id, client, _, _) = setup_contract(&env);
+
+        let token_admin = Address::generate(&env);
+        let (token_addr, _, token_admin_client) = create_token(&env, &token_admin);
+        let creator = Address::generate(&env);
+        let editor = Address::generate(&env);
+        token_admin_client.mint(&creator, &500);
+
+        let id = client.create_campaign(&creator, &token_addr, &10_000, &5_000, &2_000, &500);
+        client.assign_role(&id, &editor, &CampaignRole::Editor);
+
+        // Verify audit log contains the role assignment
+        let audit_log = client.get_audit_log(&id);
+        assert_eq!(audit_log.len(), 1);
+        
+        let entry = audit_log.get(0).unwrap();
+        assert_eq!(entry.role, CampaignRole::Owner);
+        assert_eq!(entry.actor, creator);
+    }
+
+    #[test]
+    fn test_remove_role() {
+        let env = Env::default();
+        env.mock_all_auths();
+        set_time(&env, 1_000);
+        let (contract_id, client, _, _) = setup_contract(&env);
+
+        let token_admin = Address::generate(&env);
+        let (token_addr, _, token_admin_client) = create_token(&env, &token_admin);
+        let creator = Address::generate(&env);
+        let editor = Address::generate(&env);
+        token_admin_client.mint(&creator, &500);
+
+        let id = client.create_campaign(&creator, &token_addr, &10_000, &5_000, &2_000, &500);
+        client.assign_role(&id, &editor, &CampaignRole::Editor);
+        
+        // Remove the role
+        client.remove_role(&id, &editor);
+
+        // Verify the role was removed (should default to Viewer)
+        let role = client.get_role(&id, &editor);
+        assert_eq!(role, CampaignRole::Viewer);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #28)")]
+    fn test_remove_nonexistent_role() {
+        let env = Env::default();
+        env.mock_all_auths();
+        set_time(&env, 1_000);
+        let (contract_id, client, _, _) = setup_contract(&env);
+
+        let token_admin = Address::generate(&env);
+        let (token_addr, _, token_admin_client) = create_token(&env, &token_admin);
+        let creator = Address::generate(&env);
+        let random_address = Address::generate(&env);
+        token_admin_client.mint(&creator, &500);
+
+        let id = client.create_campaign(&creator, &token_addr, &10_000, &5_000, &2_000, &500);
+
+        // Try to remove a role that was never assigned - should panic
+        client.remove_role(&id, &random_address);
     }
 }

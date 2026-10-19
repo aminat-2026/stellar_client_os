@@ -18,6 +18,7 @@ import {
   Crown,
   TreePine,
   Download,
+  Coins,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -32,8 +33,11 @@ import { CampaignAnalyticsDashboard } from "@/components/modules/campaign/analyt
 import { BackerCommunity } from "@/components/modules/campaign/community/BackerCommunity";
 import { CampaignFollowButton } from "@/components/modules/campaign/follow/CampaignFollowButton";
 import { TopBackers } from "@/components/modules/campaign/backers/TopBackers";
+import { CampaignReviews } from "@/components/modules/campaign/reviews/CampaignReviews";
+import { MilestoneFundRelease } from "@/components/modules/campaign/milestones/MilestoneFundRelease";
 import { TOP_BACKERS_LIMIT } from "@/types/campaign-backers";
 import { CampaignFundingVelocityChart } from "@/components/modules/campaign/FundingVelocityChart";
+import { FundingCounter } from "@/components/modules/campaign/FundingCounter";
 import { CampaignAccessibilityControls } from "@/components/modules/campaign/CampaignAccessibilityControls";
 import { CampaignImpactCalculator } from "@/components/modules/impact/CampaignImpactCalculator";
 import { CampaignFollow } from "@/components/modules/campaign/CampaignFollow";
@@ -41,6 +45,8 @@ import { VerificationMediaGallery, type VerificationMediaItem } from "@/componen
 import { CO2SequestrationProjection } from "@/components/modules/dashboard/CO2SequestrationProjection";
 import { CampaignSustainabilityScore } from "@/components/modules/campaign/sustainability/CampaignSustainabilityScore";
 import { OneTimeDonationButton } from "@/components/modules/campaign/donation/OneTimeDonationButton";
+import { CampaignCharityBadge } from "@/components/modules/campaign/CharityBadge";
+import { StaffPickBadge } from "@/components/modules/campaign/StaffPickBadge";
 
 const translations = {
   en: {
@@ -330,6 +336,8 @@ export default function CampaignDetailPage({ params }: { params: Promise<{ id: s
     targetTrees: 2000,
     treeType: "Mangrove",
     location: "Amazon Basin, South America",
+    isStaffPick: true,
+    staffPickReason: "Outstanding community guardianship and verifiable canopy restoration.",
   };
 
   const sustainabilityScore = React.useMemo(
@@ -354,15 +362,6 @@ export default function CampaignDetailPage({ params }: { params: Promise<{ id: s
   const detectedLanguageName = languageNames[detectedLang] ?? detectedLang;
   const [translationLang, setTranslationLang] = useState<TranslationKey | "">("");
   const translation = translationLang ? translations[translationLang] : null;
-
-  const progressPct = Math.min(
-    100,
-    Math.round(
-      (parseFloat(campaign.raisedAmount.replace(/,/g, "")) /
-        parseFloat(campaign.goalAmount.replace(/,/g, ""))) *
-        100
-    )
-  );
 
   return (
     <div
@@ -392,6 +391,11 @@ export default function CampaignDetailPage({ params }: { params: Promise<{ id: s
           <Link href="/campaigns/create">
             <Button size="sm" variant="outline" className="border-purple-600/40 text-purple-300 hover:bg-purple-950/40 text-xs">
               <Edit className="mr-1.5 h-3.5 w-3.5" /> Edit Campaign
+            </Button>
+          </Link>
+          <Link href="/campaigns/social-scheduler">
+            <Button size="sm" variant="outline" className="border-sky-600/40 text-sky-300 hover:bg-sky-950/40 text-xs">
+              Schedule Promotions
             </Button>
           </Link>
           <Button
@@ -487,6 +491,10 @@ export default function CampaignDetailPage({ params }: { params: Promise<{ id: s
                 tier={sustainabilityScore.tier}
                 size="sm"
               />
+              {campaign.isStaffPick && (
+                <StaffPickBadge reason={campaign.staffPickReason} size="sm" />
+              )}
+              <CampaignCharityBadge campaignId={campaign.id} />
             </div>
 
             <div className="flex flex-wrap items-center gap-2 pt-1">
@@ -525,8 +533,14 @@ export default function CampaignDetailPage({ params }: { params: Promise<{ id: s
             </div>
           </div>
 
-          {/* Raise Goal Card */}
+          {/* Raise Goal Card — rolling real-time funding counter (#1259) */}
           <div className="w-full md:w-80 rounded-xl border border-zinc-800 bg-zinc-950/80 p-5 space-y-4 shadow-xl">
+            <FundingCounter
+              campaignId={campaign.id}
+              initialRaised={campaign.raisedAmount}
+              initialGoal={campaign.goalAmount}
+              token={campaign.token}
+            />
             <div className="flex items-baseline justify-between">
               <span className="text-xs font-semibold text-zinc-400">Total Raised</span>
               <span className="text-xs font-bold text-emerald-400">{progressPct}% Funded</span>
@@ -609,6 +623,9 @@ export default function CampaignDetailPage({ params }: { params: Promise<{ id: s
           <TabsTrigger value="analytics" className="text-xs font-semibold data-[state=active]:bg-purple-600 data-[state=active]:text-white">
             <BarChart3 className="mr-1.5 h-4 w-4 text-emerald-400" /> Analytics
           </TabsTrigger>
+          <TabsTrigger value="milestone-release" className="text-xs font-semibold data-[state=active]:bg-purple-600 data-[state=active]:text-white">
+            <Coins className="mr-1.5 h-4 w-4 text-emerald-400" /> Tranche Releases
+          </TabsTrigger>
         </TabsList>
 
         {/* Tab 1: Overview */}
@@ -670,16 +687,11 @@ export default function CampaignDetailPage({ params }: { params: Promise<{ id: s
 
             <div className="space-y-4">
               <CampaignFundingVelocityChart
-                data={[
-                  { label: "Mon", raised: 2600 },
-                  { label: "Tue", raised: 3000 },
-                  { label: "Wed", raised: 4200 },
-                  { label: "Thu", raised: 5800 },
-                  { label: "Fri", raised: 7300 },
-                  { label: "Sat", raised: 8100 },
-                  { label: "Sun", raised: 9600 },
-                ]}
-                currency="XLM"
+                campaignId={campaign.id}
+                startDate={campaign.startDate}
+                endDate={campaign.endDate}
+                granularity="daily"
+                currency={campaign.token}
               />
 
               <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 p-5 space-y-3">
@@ -699,6 +711,17 @@ export default function CampaignDetailPage({ params }: { params: Promise<{ id: s
               <BackerCommunity campaignId={campaign.id} canManage={isCreatorView} />
             </div>
           </div>
+
+          {/* Backer testimonials & star ratings (#1250) */}
+          <CampaignReviews campaignId={campaign.id} viewerAddress={viewerAddress} />
+
+          {/* Milestone-based fund release tied to backer approval vote */}
+          <MilestoneFundRelease
+            campaignId={campaign.id}
+            isCreator={isCreatorView}
+            viewerAddress={viewerAddress}
+            campaignStatus={campaign.status}
+          />
         </TabsContent>
 
         <TabsContent value="ar-view">
@@ -775,6 +798,16 @@ export default function CampaignDetailPage({ params }: { params: Promise<{ id: s
         {/* Tab 8: Analytics for creators */}
         <TabsContent value="analytics">
           <CampaignAnalyticsDashboard campaignId={campaign.id} campaignTitle={campaign.title} />
+        </TabsContent>
+
+        {/* Tab 9: Milestone-based fund release tied to backer approval vote */}
+        <TabsContent value="milestone-release">
+          <MilestoneFundRelease
+            campaignId={campaign.id}
+            isCreator={isCreatorView}
+            viewerAddress={viewerAddress}
+            campaignStatus={campaign.status}
+          />
         </TabsContent>
       </Tabs>
 
